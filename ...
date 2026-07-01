@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+  <title>Microsoft OneDrive</title>
+  <style type="text/css">
+    body {
+      font-family:"Segoe UI", arial, sans-serif;
+      font-size:88%;
+      margin:0;
+    }
+    a, a:visited {
+      color: #0078D4;
+      text-decoration:none;
+    }
+    h1 {
+      height:50px;
+      background: #0078D4;
+      margin: 0;
+      font-size: 140%;
+      font-family:"Segoe UI Semibold", arial, sans-serif;
+      display: flex;
+      justify-content: space-between;
+    }
+    h1 a, h1 a:visited {
+      color:#fff;
+      line-height:47px;
+      padding:0 10px;
+    }
+    #signout {
+        font-size: 14px;
+    }
+    #content {
+      margin:0 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1><a href="https://onedrive.live.com">OneDrive</a><a id="signout" href="https://login.live.com/logout.srf?id=250206">Sign out</a></h1>
+  <div id="content">
+    <p>Sorry, an error has occurred.</p>
+    <p><a href="https://onedrive.live.com">Microsoft OneDrive</a></p>
+  </div>
+</body>
+</html>

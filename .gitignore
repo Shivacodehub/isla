@@ -1,0 +1,26 @@
+# Datasets & Inputs
+data/
+class_images/
+paired_set/
+coco_list/
+
+# Experiment Outputs & Heavy Logs
+experiments/
+outputs/
+results/
+*.log
+*.csv
+
+# Model Weights (Crucial to ignore)
+models/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Python Cache & System files
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
