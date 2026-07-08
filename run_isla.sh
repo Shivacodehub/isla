@@ -3,13 +3,16 @@
 
 MODEL="models/stable-diffusion-v1-5"
 LR=5e-6
-ITER=201
-INNER=30
+ITER=100
+INNER=10
 BATCH=1
 SEED=0
 
 EXP=$1
 
+###############################################################################
+# ISLA PROTECTION
+###############################################################################
 if [ "$EXP" = "isla001" ]; then
     python protect.py \
         --pretrained_model_name_or_path $MODEL \
@@ -51,9 +54,17 @@ if [ "$EXP" = "isla001" ]; then
         --phase0_timesteps 100 300 500 700 900
 fi
 
+###############################################################################
+# DREAMBOOTH ATTACK + EVALUATION
+###############################################################################
 if [ "$EXP" = "isla001_attack" ]; then
-    for SUBJ in 1 2 3 4; do
-        echo "=== Attacking subject ${SUBJ} ==="
+
+    for SUBJ in 1 2 3 4
+    do
+        echo "================================================="
+        echo "Attacking Subject ${SUBJ}"
+        echo "================================================="
+
         python train_dreambooth.py \
             --pretrained_model_name_or_path $MODEL \
             --additional_unet_path experiments/isla001_debug/unet_002.pt \
@@ -67,13 +78,23 @@ if [ "$EXP" = "isla001_attack" ]; then
             --train_batch_size 1 \
             --seed $SEED
 
-        echo "=== Evaluating subject ${SUBJ} ==="
+        echo "================================================="
+        echo "Evaluating Subject ${SUBJ}"
+        echo "================================================="
+
         python evaluate_db.py \
             --checkpoint experiments/isla001_attack_s${SUBJ} \
             --class_noun person \
-            --identifier sks${SUBJ} \
-            --data_dir data/person${SUBJ}/set_A \
+            --identifier "sks${SUBJ}" \
+            --data_dir data/person${SUBJ}/set_B \
             --output_dir experiments/isla001_debug/eval_s${SUBJ} \
-            --dino_score
+            --scheduler pndm \
+            --num_inference_steps 20 \
+            --seed $SEED \
+            --dino_score \
+            --clip_score \
+            --brisque
+
     done
+
 fi
