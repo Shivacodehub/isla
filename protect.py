@@ -24,9 +24,15 @@ New args (all optional, have defaults):
 All original APDM args are preserved unchanged.
 """
 
+import os
+import gc
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "max_split_size_mb:256,garbage_collection_threshold:0.8"
+)
+
 import torch
 import random
-import os
 import itertools
 import sys
 import numpy as np
@@ -52,7 +58,7 @@ from mgda import extract_flat_grad, apply_flat_grad, combine_gradients_mgda
 # ===========================================================================
 
 class ImageDataset(Dataset):
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, preload=False):
         self.data_dir = data_dir
         self.transform = transforms.Compose([
             transforms.Resize(512),
@@ -60,11 +66,22 @@ class ImageDataset(Dataset):
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         self.images = os.listdir(data_dir)
+        self.preload = preload
+        self._cache = None
+        if preload:
+            print(f"[INFO] Preloading {len(self.images)} images from {data_dir} into RAM...")
+            self._cache = []
+            for fname in self.images:
+                img = Image.open(os.path.join(data_dir, fname)).convert("RGB")
+                self._cache.append(self.transform(img))
+            print(f"[INFO] Preload complete: {len(self._cache)} images cached")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
+        if self.preload and self._cache is not None:
+            return self._cache[idx]
         img = Image.open(os.path.join(self.data_dir, self.images[idx])).convert("RGB")
         if self.transform:
             img = self.transform(img)
@@ -414,6 +431,10 @@ def parse_args():
     parser.add_argument("--phase0_timesteps", nargs="+", type=int,
                         default=[100, 300, 500, 700, 900])
 
+    parser.add_argument("--secondary_gpu", type=int, default=None,
+                        help="If set, place unet_ref on this GPU index "
+                             "(e.g. --secondary_gpu 1) to free primary GPU memory")
+
     args = parser.parse_args()
 
     # Auto-fill subject_data_dirs / subject_prompts if ISLA but not provided
@@ -461,27 +482,29 @@ def main(args):
         torch.cuda.empty_cache()
 
     # ── Load pipeline ────────────────────────────────────────────────────────
+    print("[INFO] Loading pipeline...", flush=True)
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path, safety_checker=None,
-        torch_dtype=torch.float16
+        torch_dtype=torch.float32
     ).to("cuda")
     pipe.safety_checker = None
-    # Cast trainable components to float32 — fp16 was only for fast loading
-    pipe.unet = pipe.unet.float()
-    pipe.text_encoder = pipe.text_encoder.float()
-    pipe.vae = pipe.vae.float()
+    print("[INFO] Pipeline loaded.", flush=True)
 
     # ── Data loaders ─────────────────────────────────────────────────────────
-    image_dataset = ImageDataset(args.instance_data_dir)
+    print("[INFO] Preloading instance images...", flush=True)
+    image_dataset = ImageDataset(args.instance_data_dir, preload=True)
     image_loader = DataLoader(image_dataset, batch_size=args.batch_size,
-                              shuffle=True)
+                              shuffle=True, num_workers=0)
     image_loader = sample_data(image_loader)
 
     if args.with_prior_preservation or args.in_ppl or args.isla_mode:
-        class_image_dataset = ImageDataset(args.class_data_dir)
+        print("[INFO] Loading class image dataset...", flush=True)
+        class_image_dataset = ImageDataset(args.class_data_dir, preload=False)
         class_image_loader = DataLoader(class_image_dataset,
-                                        batch_size=args.batch_size, shuffle=True)
+                                        batch_size=args.batch_size,
+                                        shuffle=True, num_workers=0)
         class_image_loader = sample_data(class_image_loader)
+        print(f"[INFO] Class dataset ready: {len(class_image_dataset)} images", flush=True)
 
     if args.loss_dpo and args.loss_dpo_paired_dataset:
         paired_image_dataset = PairedImageDataset(
@@ -557,8 +580,9 @@ def main(args):
         # Per-subject image loaders for ISLA inner loop
         subject_loaders = []
         for sd in args.subject_data_dirs:
-            ds = ImageDataset(sd)
-            dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
+            ds = ImageDataset(sd, preload=True)
+            dl = DataLoader(ds, batch_size=args.batch_size,
+                            shuffle=True, num_workers=0)
             subject_loaders.append(sample_data(dl))
 
         # Encode all subject prompts once
@@ -567,8 +591,8 @@ def main(args):
             emb, _ = encode_prompt(tokenizer, text_encoder, prompt, False)
             subject_prompt_embs.append(emb.detach())
 
-        # Frozen reference UNet for L_pres — keep on CPU to save GPU memory
-        unet_ref = deepcopy(pipe.unet).cpu()
+        # Frozen reference UNet for L_pres — kept on GPU (48GB A6000 has room)
+        unet_ref = deepcopy(pipe.unet).to("cuda")
         unet_ref.requires_grad_(False)
         unet_ref.eval()
 
@@ -578,63 +602,77 @@ def main(args):
     start_time = datetime.now()
 
     for i in range(args.iter):
+        print(f"[DEBUG] >>> Starting iter {i}", flush=True)
         optimizer.zero_grad()
 
-        unet_temp = deepcopy(pipe.unet)
-        unet_temp.enable_gradient_checkpointing()   # halves activation memory
-        optimizer_temp = torch.optim.AdamW(
-            unet_temp.parameters(), lr=args.lr,
-            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8
-        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
-        # ── Register ISLA hooks on unet_temp ────────────────────────────────
-        if args.isla_mode and head_info is not None:
-            isla_hooks = ISLAHookManager(
-                unet_temp,
-                head_info["selected_heads"],
-                head_info["Q_h_dict"],
+        print(f"[DEBUG] iter {i}: GPU mem before deepcopy: "
+              f"{torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+              f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved", flush=True)
+
+        # In ISLA mode: skip unet_temp entirely — all losses computed on pipe.unet
+        # In APDM mode: create unet_temp for the inner DreamBooth loop
+        unet_temp = None
+        optimizer_temp = None
+        isla_hooks = None
+
+        if not args.isla_mode:
+            unet_temp = deepcopy(pipe.unet)
+            optimizer_temp = torch.optim.AdamW(
+                unet_temp.parameters(), lr=args.lr,
+                betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8
             )
 
-        # ── Inner loop: DB fine-tune on unet_temp ───────────────────────────
-        for j in range(args.num_inner_iter):
-            optimizer_temp.zero_grad()
+        # ── Inner loop: only run in non-ISLA (APDM) mode ────────────────────
+        if not args.isla_mode and unet_temp is not None:
+            for j in range(args.num_inner_iter):
+                print(f"[DEBUG] iter {i} inner {j}: start", flush=True)
+                optimizer_temp.zero_grad()
 
-            data = next(image_loader).to("cuda")
-            t = torch.randint(
-                0, ddpm_scheduler.config.num_train_timesteps,
-                (args.batch_size,), device="cuda"
-            ).long()
-            z_0 = vae.encode(data).latent_dist.sample() * vae.config.scaling_factor
-            eps = torch.randn_like(z_0)
-            z_t = ddpm_scheduler.add_noise(z_0, eps, t)
+                data = next(image_loader).to("cuda")
+                t = torch.randint(
+                    0, ddpm_scheduler.config.num_train_timesteps,
+                    (args.batch_size,), device="cuda"
+                ).long()
+                with torch.no_grad():
+                    z_0 = vae.encode(data).latent_dist.sample() * vae.config.scaling_factor
+                eps = torch.randn_like(z_0)
+                z_t = ddpm_scheduler.add_noise(z_0, eps, t)
 
-            prompt_embeds, _ = encode_prompt(tokenizer, text_encoder,
-                                             args.instance_prompt, False)
-            model_pred = unet_temp(z_t, t, encoder_hidden_states=prompt_embeds,
-                                   return_dict=False)[0]
+                prompt_embeds, _ = encode_prompt(tokenizer, text_encoder,
+                                                 args.instance_prompt, False)
+                model_pred = unet_temp(z_t, t, encoder_hidden_states=prompt_embeds,
+                                       return_dict=False)[0]
 
-            target = eps if ddpm_scheduler.config.prediction_type == "epsilon" \
-                else ddpm_scheduler.get_velocity(model_pred, eps, t)
+                target = eps if ddpm_scheduler.config.prediction_type == "epsilon" \
+                    else ddpm_scheduler.get_velocity(model_pred, eps, t)
 
-            loss_db = F.mse_loss(model_pred, target, reduction="mean")
+                loss_db = F.mse_loss(model_pred, target, reduction="mean")
 
-            if args.with_prior_preservation:
-                class_data = next(class_image_loader).to("cuda")
-                z_0_cls = vae.encode(class_data).latent_dist.sample() * vae.config.scaling_factor
-                eps_cls = torch.randn_like(z_0_cls)
-                z_t_cls = ddpm_scheduler.add_noise(z_0_cls, eps_cls, t)
-                prompt_embeds_cls, _ = encode_prompt(tokenizer, text_encoder,
-                                                     args.class_prompt, False)
-                model_pred_cls = unet_temp(z_t_cls, t,
-                                           encoder_hidden_states=prompt_embeds_cls,
-                                           return_dict=False)[0]
-                target_cls = eps_cls if ddpm_scheduler.config.prediction_type == "epsilon" \
-                    else ddpm_scheduler.get_velocity(model_pred_cls, eps_cls, t)
-                loss_cls = F.mse_loss(model_pred_cls, target_cls, reduction="mean")
-                loss_db = loss_db + args.prior_loss_weight * loss_cls
+                if args.with_prior_preservation:
+                    class_data = next(class_image_loader).to("cuda")
+                    with torch.no_grad():
+                        z_0_cls = vae.encode(class_data).latent_dist.sample() \
+                                  * vae.config.scaling_factor
+                    eps_cls = torch.randn_like(z_0_cls)
+                    z_t_cls = ddpm_scheduler.add_noise(z_0_cls, eps_cls, t)
+                    prompt_embeds_cls, _ = encode_prompt(tokenizer, text_encoder,
+                                                         args.class_prompt, False)
+                    model_pred_cls = unet_temp(z_t_cls, t,
+                                               encoder_hidden_states=prompt_embeds_cls,
+                                               return_dict=False)[0]
+                    target_cls = eps_cls if ddpm_scheduler.config.prediction_type == "epsilon" \
+                        else ddpm_scheduler.get_velocity(model_pred_cls, eps_cls, t)
+                    loss_cls = F.mse_loss(model_pred_cls, target_cls, reduction="mean")
+                    loss_db = loss_db + args.prior_loss_weight * loss_cls
 
-            loss_db.backward()
-            optimizer_temp.step()
+                loss_db.backward()
+                optimizer_temp.step()
+                del data, z_0, z_t, eps, model_pred, loss_db
+                torch.cuda.empty_cache()
 
         # ── Outer: compute negative / protection loss ─────────────────────────
         data = next(image_loader).to("cuda")
@@ -642,13 +680,17 @@ def main(args):
             0, ddpm_scheduler.config.num_train_timesteps,
             (args.batch_size,), device="cuda"
         ).long()
-        z_0 = vae.encode(data).latent_dist.sample() * vae.config.scaling_factor
+        with torch.no_grad():
+            z_0 = vae.encode(data).latent_dist.sample() * vae.config.scaling_factor
         eps = torch.randn_like(z_0)
         z_t = ddpm_scheduler.add_noise(z_0, eps, t)
         prompt_embeds, _ = encode_prompt(tokenizer, text_encoder,
                                          args.instance_prompt, False)
-        model_pred = unet_temp(z_t, t, encoder_hidden_states=prompt_embeds,
-                               return_dict=False)[0]
+
+        # Use pipe.unet in ISLA mode, unet_temp in APDM mode
+        active_unet = pipe.unet if args.isla_mode else unet_temp
+        model_pred = active_unet(z_t, t, encoder_hidden_states=prompt_embeds,
+                                 return_dict=False)[0]
         target = eps if ddpm_scheduler.config.prediction_type == "epsilon" \
             else ddpm_scheduler.get_velocity(model_pred, eps, t)
 
@@ -728,115 +770,125 @@ def main(args):
         # ── ISLA losses ───────────────────────────────────────────────────────
         if args.isla_mode and head_info is not None and arcface is not None:
 
-            flat_grads_subjects = []
+            # KEY MEMORY FIX: compute all subject losses directly on pipe.unet
+            # No unet_temp copies, no CPU gradient extraction, no flat_grads.
+            # Approximate MGDA via inverse-loss weighting to avoid storing
+            # 4 x 3.5GB gradient copies simultaneously.
 
+            # Step 1: get loss magnitudes cheaply (no_grad)
+            loss_magnitudes = []
+            with torch.no_grad():
+                for subj_idx in range(args.num_subjects):
+                    s_data = next(subject_loaders[subj_idx]).to("cuda")
+                    t_s = torch.randint(0,
+                        ddpm_scheduler.config.num_train_timesteps,
+                        (args.batch_size,), device="cuda").long()
+                    z_0_s = vae.encode(s_data).latent_dist.sample() \
+                            * vae.config.scaling_factor
+                    eps_s = torch.randn_like(z_0_s)
+                    z_t_s = ddpm_scheduler.add_noise(z_0_s, eps_s, t_s)
+                    pred = pipe.unet(z_t_s, t_s,
+                        encoder_hidden_states=subject_prompt_embs[subj_idx],
+                        return_dict=False)[0]
+                    loss_magnitudes.append(F.mse_loss(pred, eps_s).item())
+                    del s_data, z_0_s, z_t_s, pred, eps_s
+                    torch.cuda.empty_cache()
+
+            # Inverse-loss weights
+            inv = torch.tensor([1.0 / (l + 1e-8) for l in loss_magnitudes])
+            weights = (inv / inv.sum()).tolist()
+            print(f"  [MGDA-approx] weights = {[round(w,3) for w in weights]}")
+
+            # Step 2: re-register ISLA hooks on pipe.unet directly
+            if isla_hooks:
+                isla_hooks.remove()
+            isla_hooks = ISLAHookManager(
+                pipe.unet,
+                head_info["selected_heads"],
+                head_info["Q_h_dict"],
+            )
+
+            # Step 3: per-subject backward, one at a time, directly into pipe.unet
+            pipe.unet.zero_grad()
             for subj_idx in range(args.num_subjects):
-                unet_temp.zero_grad()
-                if isla_hooks:
-                    isla_hooks.clear_store()
+                w = weights[subj_idx]
+                isla_hooks.clear_store()
 
-                # Subject data
                 s_data = next(subject_loaders[subj_idx]).to("cuda")
-                t_s = torch.randint(
-                    0, ddpm_scheduler.config.num_train_timesteps,
-                    (args.batch_size,), device="cuda"
-                ).long()
+                t_s = torch.randint(0,
+                    ddpm_scheduler.config.num_train_timesteps,
+                    (args.batch_size,), device="cuda").long()
                 with torch.no_grad():
                     z_0_s = vae.encode(s_data).latent_dist.sample() \
                             * vae.config.scaling_factor
                 eps_s = torch.randn_like(z_0_s)
                 z_t_s = ddpm_scheduler.add_noise(z_0_s, eps_s, t_s)
-
                 p_emb = subject_prompt_embs[subj_idx]
 
-                # Forward through modified UNet
-                model_pred_s = unet_temp(
-                    z_t_s, t_s, encoder_hidden_states=p_emb,
-                    return_dict=False
-                )[0]
+                pred_s = pipe.unet(z_t_s, t_s,
+                    encoder_hidden_states=p_emb, return_dict=False)[0]
+                loss_db_s = F.mse_loss(pred_s, eps_s)
 
-                # L_DB per subject (keep model functional)
-                loss_db_s = F.mse_loss(model_pred_s, eps_s)
-
-                # L_ID: identity suppression
                 e_gen = fast_decode_identity(
-                    unet_temp, vae, ddpm_scheduler, arcface,
-                    z_t_s, t_s, p_emb
-                )
-                mean_emb = head_info["mean_embeddings"][subj_idx]
-                sim = torch.dot(F.normalize(e_gen, dim=0), mean_emb.detach())
+                    pipe.unet, vae, ddpm_scheduler, arcface, z_t_s, t_s, p_emb)
+                sim = torch.dot(
+                    F.normalize(e_gen, dim=0),
+                    head_info["mean_embeddings"][subj_idx].detach())
                 loss_id_s = torch.clamp(sim - args.id_tau, min=0.0)
 
-                # L_head: head regularization
                 loss_head_s = head_regularization_loss(
                     isla_hooks.z_h_store,
                     head_info["Q_h_dict"],
-                    head_info["selected_heads"]
-                ) if isla_hooks else torch.tensor(0.0, device="cuda")
+                    head_info["selected_heads"])
 
-                # L_pres: preservation vs frozen reference (unet_ref on CPU)
-                class_data_pres = next(class_image_loader).to("cuda")
+                cls_data = next(class_image_loader).to("cuda")
                 with torch.no_grad():
-                    z_0_pres = vae.encode(class_data_pres).latent_dist.sample() \
-                               * vae.config.scaling_factor
-                eps_pres = torch.randn_like(z_0_pres)
-                z_t_pres = ddpm_scheduler.add_noise(z_0_pres, eps_pres, t_s)
-                prompt_embs_cls, _ = encode_prompt(
-                    tokenizer, text_encoder, args.class_prompt, False
-                )
-                # unet_ref on CPU — move inputs to CPU, run, move result back
+                    z_cls = vae.encode(cls_data).latent_dist.sample() \
+                            * vae.config.scaling_factor
+                eps_cls = torch.randn_like(z_cls)
+                z_t_cls = ddpm_scheduler.add_noise(z_cls, eps_cls, t_s)
+                c_cls, _ = encode_prompt(tokenizer, text_encoder,
+                                         args.class_prompt, False)
                 with torch.no_grad():
-                    feats_ref = unet_ref(
-                        z_t_pres.cpu(), t_s.cpu(),
-                        encoder_hidden_states=prompt_embs_cls.cpu(),
-                        return_dict=False
-                    )[0].to("cuda")
-                feats_new = unet_temp(
-                    z_t_pres, t_s,
-                    encoder_hidden_states=prompt_embs_cls,
-                    return_dict=False
-                )[0]
-                loss_pres_s = F.mse_loss(feats_new, feats_ref.detach())
+                    ref_out = unet_ref(z_t_cls, t_s,
+                        encoder_hidden_states=c_cls,
+                        return_dict=False)[0].detach()
+                new_out = pipe.unet(z_t_cls, t_s,
+                    encoder_hidden_states=c_cls, return_dict=False)[0]
+                loss_pres_s = F.mse_loss(new_out, ref_out)
 
-                loss_subj = (
-                    loss_db_s
+                total_s = (loss_db_s
                     + args.lambda_id * loss_id_s
                     + args.lambda_head * loss_head_s
-                    + args.lambda_pres * loss_pres_s
-                )
-                loss_subj.backward()
+                    + args.lambda_pres * loss_pres_s)
 
-                # Extract grad to CPU immediately to free GPU memory
-                flat_g = extract_flat_grad(unet_temp).clone()  # CPU tensor
-                flat_grads_subjects.append(flat_g)
-                unet_temp.zero_grad()
+                (w * total_s).backward()
+
+                del s_data, z_0_s, z_t_s, pred_s, eps_s, e_gen, sim
+                del loss_db_s, loss_id_s, loss_head_s
+                del cls_data, z_cls, z_t_cls, ref_out, new_out
+                del loss_pres_s, total_s, p_emb
+                gc.collect()
                 torch.cuda.empty_cache()
 
-            # MGDA on CPU
-            combined_grad, alpha = combine_gradients_mgda(
-                flat_grads_subjects, unet_temp, device="cuda"
-            )
+            del loss_magnitudes, weights, inv
+            gc.collect()
+            torch.cuda.empty_cache()
 
-            # Add negative loss gradient
+            # Add negative loss grad from unet_temp to pipe.unet
             if loss_neg.requires_grad:
                 loss_neg.backward()
-                neg_flat = extract_flat_grad(unet_temp).cpu()
-                unet_temp.zero_grad()
-                combined_grad = combined_grad + neg_flat
-
-            # Write combined grad directly into pipe.unet (skip unet_temp transfer)
-            offset = 0
-            for p_main, p_temp in zip(pipe.unet.parameters(),
-                                       unet_temp.parameters()):
-                numel = p_main.numel()
-                chunk = combined_grad[offset: offset + numel].to("cuda").view(p_main.shape)
-                if args.unfreeze is None:
-                    p_main.grad = chunk.to(p_main.dtype)
-                offset += numel
+                with torch.no_grad():
+                    for p_main, p_temp in zip(pipe.unet.parameters(),
+                                               unet_temp.parameters()):
+                        if p_temp.grad is not None:
+                            if p_main.grad is None:
+                                p_main.grad = p_temp.grad.clone()
+                            else:
+                                p_main.grad += p_temp.grad
 
         else:
             loss_neg.backward()
-            # Transfer grads unet_temp -> pipe.unet
             with torch.no_grad():
                 for (name1, param1), (_, param2) in zip(
                     pipe.unet.named_parameters(), unet_temp.named_parameters()
@@ -869,9 +921,13 @@ def main(args):
             sys.stdout.flush()
 
         # ── Save checkpoint ───────────────────────────────────────────────────
+        print(f"[DEBUG] iter {i}: checking save condition "
+              f"(save_freq={args.save_freq}, iter-1={args.iter-1})", flush=True)
         if (i != 0 and i % args.save_freq == 0) or i == args.iter - 1:
+            print(f"[DEBUG] iter {i}: SAVING checkpoint to {save_path}/unet_{str(i).zfill(3)}.pt", flush=True)
             torch.save(pipe.unet.state_dict(),
                        f"{save_path}/unet_{str(i).zfill(3)}.pt")
+            print(f"[DEBUG] iter {i}: checkpoint saved successfully", flush=True)
             if args.train_text_encoder:
                 torch.save(pipe.text_encoder.state_dict(),
                            f"{save_path}/text_encoder_{str(i).zfill(3)}.pt")
@@ -886,12 +942,16 @@ def main(args):
                     pickle.dump(info_save, f)
 
         # Cleanup
+        print(f"[DEBUG] iter {i}: cleanup start", flush=True)
         if isla_hooks is not None:
             isla_hooks.remove()
             isla_hooks = None
+        print(f"[DEBUG] iter {i}: hooks removed", flush=True)
 
         del unet_temp
+        print(f"[DEBUG] iter {i}: unet_temp deleted, calling empty_cache...", flush=True)
         torch.cuda.empty_cache()
+        print(f"[DEBUG] iter {i}: <<< iter complete", flush=True)
 
 
 if __name__ == "__main__":
